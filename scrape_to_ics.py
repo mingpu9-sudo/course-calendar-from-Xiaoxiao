@@ -2,41 +2,40 @@ import os, re, hashlib, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
 
-# ========= 必改：把这条替换成你在 Network 里复制到的“timetable?ym=...”完整URL =========
+# ←←← 把这条替换成你在 Network 里复制到的 timetable 完整 URL（包含 ym=YYYY-MM）
 API_URL_SAMPLE = "https://xapi.xiaosaas.com/rest/opp/fteacher/timetable?ym=2025-09&seeme=&tok=e1d8d4f601cedca7d8b7812059499494&lang=cn"
-# ==================================================================================
 
 NEED_LOGIN = True
-COOKIE_STRING = os.getenv("COOKIES", "")  # 已在仓库 Secrets 里配置
+COOKIE_STRING = os.getenv("COOKIES", "")
 
-# 日历显示设置
 LOCAL_TZ = "Asia/Shanghai"
 CAL_NAME = "Company Courses"
 ICS_FILENAME = "schedule.ics"
 
-# —— 工具函数 ——
-def month_str(d: dt.date) -> str:
-    return d.strftime("%Y-%m")  # "2025-09"
+# ---------- 月份范围：前2 ~ 后5，共8个月 ----------
+def shift_month(d: dt.date, delta: int) -> dt.date:
+    y = d.year + (d.month - 1 + delta) // 12
+    m = (d.month - 1 + delta) % 12 + 1
+    return dt.date(y, m, 1)
 
 def make_urls():
-    """
-    把 API_URL_SAMPLE 里 ym=YYYY-MM 替换为 上月/本月/下月，跨月也能抓到。
-    如果URL里没有 ym 参数，就只返回原始URL。
-    """
-    m = re.search(r"(ym=)\d{4}-\d{2}", API_URL_SAMPLE)
-    if not m:
+    if not re.search(r"(ym=)\d{4}-\d{2}", API_URL_SAMPLE):
         return [API_URL_SAMPLE]
     today = dt.date.today()
-    first = today.replace(day=1)
-    months = [ (first - dt.timedelta(days=1)).replace(day=1),
-               first,
-               (first + dt.timedelta(days=32)).replace(day=1) ]
+    base = dt.date(today.year, today.month, 1)
     urls = []
-    for d in months:
-        ym = month_str(d)
-        urls.append(re.sub(r"(ym=)\d{4}-\d{2}", r"\1"+ym, API_URL_SAMPLE))
-    return urls
+    for k in range(-2, 6):  # 前2 ~ 后5
+        ym = shift_month(base, k).strftime("%Y-%m")
+        u = re.sub(r"(ym=)\d{4}-\d{2}", r"\1"+ym, API_URL_SAMPLE)
+        urls.append(u)
+    # 去重
+    seen, dedup = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u); dedup.append(u)
+    return dedup
 
+# ---------- 生成 ICS ----------
 def uid_for(*parts):
     raw = "||".join([p or "" for p in parts])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()+"@xiaosaas-course"
@@ -65,6 +64,7 @@ def build_ics(events):
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines) + "\r\n"
 
+# ---------- 网络与解析 ----------
 def fetch_json(url):
     headers = {"User-Agent":"Mozilla/5.0"}
     if COOKIE_STRING:
@@ -74,7 +74,6 @@ def fetch_json(url):
     return r.json()
 
 def safe_parse_dt(s: str, tz: dt.tzinfo):
-    """把 '2025-09-01 07:00' 转为带时区的 datetime。为空则返回 None。"""
     if not s:
         return None
     return dt.datetime.strptime(s.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=tz)
@@ -84,47 +83,52 @@ def scrape_via_api():
     events = []
     for url in make_urls():
         j = fetch_json(url)
-
-        # 结构：{ "data": [ { "date": "2025-09-01", "schedules": [ {...} ] }, ... ] }
-        days = j.get("data") or []                           # 修正点 A
+        days = j.get("data") or []
         for day in days:
             date_s = str(day.get("date", "")).strip()
-            for item in (day.get("schedules") or []):        # 修正点 B
-
-                # 优先使用 *_Str；没有则用毫秒时间戳兜底
+            for item in (day.get("schedules") or []):
+                # 时间：优先 *_Str；否则毫秒时间戳兜底
                 start_str = (item.get("starttimeStr") or "").strip()
                 end_str   = (item.get("endtimeStr") or "").strip()
-
                 start_dt = safe_parse_dt(start_str, tz)
                 end_dt   = safe_parse_dt(end_str, tz)
-
                 if start_dt is None and item.get("starttime"):
-                    start_ms = int(item["starttime"]) // 1000
-                    start_dt = dt.datetime.fromtimestamp(start_ms, tz=tz)
+                    start_dt = dt.datetime.fromtimestamp(int(item["starttime"])//1000, tz=tz)
                 if end_dt is None and item.get("endtime"):
-                    end_ms = int(item["endtime"]) // 1000
-                    end_dt = dt.datetime.fromtimestamp(end_ms, tz=tz)
-
-                # 若仍缺失，跳过该条
+                    end_dt   = dt.datetime.fromtimestamp(int(item["endtime"])//1000, tz=tz)
                 if start_dt is None or end_dt is None:
                     continue
+                if end_dt <= start_dt:
+                    end_dt = start_dt + dt.timedelta(minutes=80)  # 接口里 duration=80
 
-                # 标题优先：courseName；否则用 reason（如“固休”）；再不行用“课程”
-                course_name = (item.get("courseName") or "").strip()
-                reason = (item.get("reason") or "").strip()
-                title = course_name or (f"【{reason}】" if reason else "课程")
+                # 取班级 + 课程名（尽量全）
+                clz = (item.get("clzName") or "").strip()
+                course = (item.get("courseName") or "").strip()
+                reason = (item.get("reason") or "").strip()   # 有时会是“固休”等
+                # 标题规则：班级｜课程名；都没有时用【reason】；再不行“课程”
+                title_parts = [p for p in [clz, course] if p]
+                if title_parts:
+                    title = "｜".join(title_parts)
+                elif reason:
+                    title = f"【{reason}】"
+                else:
+                    title = "课程"
 
-                # 地点 / 备注（教师名）
+                # 地点 & 描述（把完整标题也放进描述，防止月视图折行看不全）
                 location = (item.get("place") or item.get("campusname") or "") or ""
                 teacher_name = ""
-                teacher_obj = item.get("teacher")
-                if isinstance(teacher_obj, dict):             # 修正点 C（更稳健）
-                    teacher_name = teacher_obj.get("name") or ""
-                desc = f"教师: {teacher_name}".strip()
+                t = item.get("teacher")
+                if isinstance(t, dict):
+                    teacher_name = (t.get("name") or "").strip()
 
-                # 兜底：如果结束早于开始，用接口里的 duration=80 分钟
-                if end_dt <= start_dt:
-                    end_dt = start_dt + dt.timedelta(minutes=80)
+                desc_lines = []
+                if title_parts:
+                    desc_lines.append(f"标题: { '｜'.join(title_parts) }")
+                if teacher_name:
+                    desc_lines.append(f"教师: {teacher_name}")
+                if location:
+                    desc_lines.append(f"地点: {location}")
+                desc = "\n".join(desc_lines) if desc_lines else ""
 
                 uid = uid_for(date_s, start_str or str(item.get("starttime")), title, location)
                 events.append({
