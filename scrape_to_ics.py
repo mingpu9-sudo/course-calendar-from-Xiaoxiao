@@ -1,62 +1,47 @@
 import os, re, hashlib, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
-from bs4 import BeautifulSoup
 
-# ===== 需要的基本配置（已为你填好，后面可再调）=====
-COURSE_URL = "https://wumingshi.xiaosaas.com/org/teacher.html?xiaov=175717602431&flagl=a"
+# ========= 必改：把这条替换成你在 Network 里复制到的“timetable?ym=...”完整URL =========
+API_URL_SAMPLE = "https://xapi.xiaosaas.com/rest/opp/fteacher/timetable?ym=2025-09&seeme=&tok=e1d8d4f601cedca7d8b7812059499494&lang=cn"  # ← 粘贴你的URL
+# ==================================================================================
+
 NEED_LOGIN = True
-COOKIE_STRING = os.getenv("COOKIES", "")  # 我们稍后把 Cookie 填到 GitHub Secrets 里
+COOKIE_STRING = os.getenv("COOKIES", "")  # 你已经在 Secrets 里加好了
 
-# 先按常见表格结构猜的选择器，跑通后可再微调
-ROW_SELECTOR = ".ant-table-tbody > tr"
-COLS = {
-    "date": "td:nth-child(1)",
-    "start": "td:nth-child(2)",
-    "end": "td:nth-child(3)",
-    "title": "td:nth-child(4)",
-    "location": "td:nth-child(5)",
-    "desc": "td:nth-child(6)",
-}
+# 日历显示设置
+LOCAL_TZ = "Asia/Shanghai"
+CAL_NAME = "WMS Courses"
+ICS_FILENAME = "schedule.ics"
 
-LOCAL_TZ = "Asia/Shanghai"            # 时区（苹果端会自动换算显示）
-CAL_NAME = "Company Courses"          # 订阅日历显示的名称
-ICS_FILENAME = "schedule.ics"         # 输出文件名（Pages 会发布它）
-# =====================================================
+# —— 工具函数 ——
+def month_str(d: dt.date) -> str:
+    return d.strftime("%Y-%m")  # "2025-09"
 
-def norm_date(s: str) -> dt.date:
-    s = s.strip()
-    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y.%m.%d", "%d-%m-%Y", "%m-%d-%Y"]:
-        try:
-            return dt.datetime.strptime(s, fmt).date()
-        except:
-            pass
-    s2 = s.replace("年", "-").replace("月", "-").replace("日", "")
-    s2 = re.sub(r"[./]", "-", s2)
-    parts = [p for p in s2.split("-") if p.strip()]
+def make_urls():
+    """
+    这个函数会自动把 API_URL_SAMPLE 里 ym=YYYY-MM 替换为
+    当月、下月、上月 三个月，尽可能多抓一点（防止跨月）。
+    如果你的URL里没有 ym 参数，就只用原始URL。
+    """
+    m = re.search(r"(ym=)\d{4}-\d{2}", API_URL_SAMPLE)
+    if not m:
+        return [API_URL_SAMPLE]
     today = dt.date.today()
-    if len(parts) == 2:
-        m, d = map(int, parts)
-        return dt.date(today.year, m, d)
-    raise ValueError(f"无法识别日期: {s}")
+    first = today.replace(day=1)
+    # 上月、本月、下月
+    months = [first - dt.timedelta(days=1), first, (first + dt.timedelta(days=32))]
+    months = [d.replace(day=1) for d in months]
+    urls = []
+    for d in months:
+        ym = month_str(d)
+        urls.append(re.sub(r"(ym=)\d{4}-\d{2}", r"\1"+ym, API_URL_SAMPLE))
+    return urls
 
-def norm_time(s: str) -> dt.time:
-    s = s.strip().lower().replace("：", ":")
-    s = s.replace("am", " am").replace("pm", " pm")
-    for fmt in ["%H:%M", "%I:%M %p", "%H.%M", "%I %p", "%H"]:
-        try:
-            return dt.datetime.strptime(s, fmt).time()
-        except:
-            pass
-    m = re.match(r"^(\d{1,2})$", s)
-    if m:
-        return dt.time(int(m.group(1)), 0)
-    raise ValueError(f"无法识别时间: {s}")
-
-def text_of(el): return (el.get_text(" ", strip=True) if el else "").strip()
-def css_select(el, selector): 
-    res = el.select_one(selector)
-    return text_of(res)
+def parse_ms_or_str(date_str: str, time_str: str, tz: dt.tzinfo) -> dt.datetime:
+    # 输入类似 "2025-09-01" + "07:00" → 返回带时区的 datetime
+    dt_obj = dt.datetime.strptime(date_str.strip()+" "+time_str.strip(), "%Y-%m-%d %H:%M")
+    return dt_obj.replace(tzinfo=tz)
 
 def uid_for(*parts):
     raw = "||".join([p or "" for p in parts])
@@ -81,53 +66,73 @@ def build_ics(events):
             f"SUMMARY:{esc(ev['title'])}",
             f"LOCATION:{esc(ev['location'])}",
             f"DESCRIPTION:{esc(ev['desc'])}",
-            # 如需提醒可加 VALARM：
-            # "BEGIN:VALARM","TRIGGER:-PT10M","ACTION:DISPLAY","DESCRIPTION:Reminder","END:VALARM",
             "END:VEVENT",
         ]
     lines.append("END:VCALENDAR")
     return "\r\n".join(lines) + "\r\n"
 
-def scrape():
-    headers = {"User-Agent": "Mozilla/5.0"}
-    if NEED_LOGIN and COOKIE_STRING:
+def fetch_json(url):
+    headers = {"User-Agent":"Mozilla/5.0"}
+    if COOKIE_STRING:
         headers["Cookie"] = COOKIE_STRING
-    r = requests.get(COURSE_URL, headers=headers, timeout=30)
+    r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    return r.json()
 
+def scrape_via_api():
     tz = ZoneInfo(LOCAL_TZ)
     events = []
-    for row in soup.select(ROW_SELECTOR):
-        try:
-            date_s  = css_select(row, COLS["date"])
-            start_s = css_select(row, COLS["start"])
-            end_s   = css_select(row, COLS["end"])
-            title   = css_select(row, COLS["title"]) or "Course"
-            location= css_select(row, COLS["location"])
-            desc    = css_select(row, COLS["desc"])
+    for url in make_urls():
+        j = fetch_json(url)
 
-            d  = norm_date(date_s)
-            t1 = norm_time(start_s)
-            t2 = norm_time(end_s)
+        # 结构：{ "data": [ { "date": "2025-09-01", "schedules": [ {...} ] }, ... ] }
+        days = j.get("data", [])
+        for day in days:
+            date_s = str(day.get("date", "")).strip()
+            for item in day.get("schedules", []):
 
-            start_dt = dt.datetime.combine(d, t1, tzinfo=tz)
-            end_dt   = dt.datetime.combine(d, t2, tzinfo=tz)
-            if end_dt <= start_dt:
-                end_dt = start_dt + dt.timedelta(minutes=90)
+                # 你提供的JSON里有：starttimeStr / endtimeStr（最可靠）
+                start_str = (item.get("starttimeStr") or "").strip()   # "2025-09-01 07:00"
+                end_str   = (item.get("endtimeStr") or "").strip()     # "2025-09-01 23:55"
 
-            uid = uid_for(str(d), start_s, end_s, title, location)
-            events.append({
-                "uid": uid, "start": start_dt, "end": end_dt,
-                "title": title, "location": location or "", "desc": desc or "",
-            })
-        except Exception as e:
-            print("Row parse error:", e)
-            continue
+                # 如果没有 *_Str，就用毫秒时间戳（以防万一）
+                if not start_str and item.get("starttime"):
+                    start_ms = int(item["starttime"]) // 1000
+                    start_dt = dt.datetime.fromtimestamp(start_ms, tz=tz)
+                else:
+                    start_dt = dt.datetime.strptime(start_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+
+                if not end_str and item.get("endtime"):
+                    end_ms = int(item["endtime"]) // 1000
+                    end_dt = dt.datetime.fromtimestamp(end_ms, tz=tz)
+                else:
+                    end_dt = dt.datetime.strptime(end_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+
+                # 标题优先级：courseName 其一；如果没有，用 reason；再不行，用“课程”
+                course_name = (item.get("courseName") or "").strip() if item.get("courseName") else ""
+                reason = (item.get("reason") or "").strip() if item.get("reason") else ""
+                title = course_name or (("【" + reason + "】") if reason else "课程")
+
+                # 地点/备注
+                location = (item.get("place") or item.get("campusname") or "") or ""
+                teacher_name = ""
+                if isinstance(item.get("teacher"), dict):
+                    teacher_name = item["teacher"].get("name") or ""
+                desc = f"教师: {teacher_name}".strip()
+
+                # 兜底：如果结束早于开始，补上80分钟（你接口里 duration=80）
+                if end_dt <= start_dt:
+                    end_dt = start_dt + dt.timedelta(minutes=80)
+
+                uid = uid_for(date_s, start_str or str(item.get("starttime")), title, location)
+                events.append({
+                    "uid": uid, "start": start_dt, "end": end_dt,
+                    "title": title, "location": location, "desc": desc
+                })
     return events
 
 if __name__ == "__main__":
-    events = scrape()
+    events = scrape_via_api()
     events.sort(key=lambda x: x["start"])
     ics = build_ics(events)
     with open(ICS_FILENAME, "w", encoding="utf-8") as f:
